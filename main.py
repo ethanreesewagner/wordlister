@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import re
 from collections import Counter
 
-url = input("Enter the URL: ") # Replace with your URL
+url = input("Enter the URL: ")
 html_content = requests.get(url).text
 soup = BeautifulSoup(html_content, "html.parser")
 all_text = soup.get_text()
