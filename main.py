@@ -10,8 +10,7 @@ all_text = soup.get_text()
 text = [
     chunk.strip().lower()
     for chunk in re.split(
-        r'[\d\n]|[^\w\s]|(?=[A-Z])|\s+',
-        all_text
+        r'[^a-zA-Z]+', all_text
     )
     if chunk.strip()
 ]
