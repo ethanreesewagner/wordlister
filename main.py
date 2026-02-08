@@ -1,93 +1,13 @@
-import requests
 import streamlit as st
 import pandas as pd
 import os
 from dotenv import load_dotenv
-from langchain_community.chat_models.openai import ChatOpenAI  # Changed import to openai
-from langchain.tools import tool
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from ddgs import DDGS
 
-from langchain.agents import initialize_agent, AgentType  # Use classic LangChain zero-shot agent
-
-# Store extracted lists for aggregation
-extracted_lists = []
-
-@tool
-def extract_list_from_url(url: str) -> str:
-    """
-    Fetches the HTML content of a URL and asks the LLM to extract and format any top/ranked lists found on the page.
-    This tool is used to get top lists from web pages, even if the page does not contain HTML tables.
-
-    Args:
-        url: The URL to extract the list from
-
-    Returns:
-        A string representation of the extracted list data, or a message if no ranked list was found.
-    """
-    global extracted_lists
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code != 200:
-            return f"Failed to retrieve {url}: HTTP {response.status_code}"
-
-        html = response.text
-
-        # Ask the LLM to extract the list from this HTML
-        system_prompt = (
-            "You are a web list extraction assistant. Given the following webpage HTML and its URL, "
-            "identify and extract any ordered or ranked lists on the topic (such as top 10 lists, rankings, etc.). "
-            "If such lists exist, output them as markdown tables with columns for item and ranking/position. "
-            "If none are found, just state that clearly. Do NOT hallucinate any list."
-        )
-        user_prompt = f"""URL: {url}
----
-HTML Content:
-{html[:9000]}
----
-Please extract any top/ranked lists you find on this page. If possible, output a markdown table or ranked list (item and rank/score if available)."""
-
-        # Use a simple chat prompt to the LLM
-        llm_response = llm([
-            HumanMessage(
-                content=f"{system_prompt}\n\n{user_prompt}"
-            )
-        ]).content
-
-        # Try to parse the LLM result as a pandas DataFrame if it's a markdown table
-        extracted_df = None
-        if "No ranked list" not in llm_response and "|" in llm_response:
-            try:
-                # Find the markdown table in the LLM response (heuristic)
-                import io
-                lines = llm_response.strip().splitlines()
-                table_lines = [line for line in lines if '|' in line and '-' not in line]
-                if len(table_lines) >= 2:
-                    # Insert the header line and possible delimiter
-                    for i, line in enumerate(lines):
-                        if "|" in line and ("---" in line or "---" in lines[i+1] if i+1 < len(lines) else False):
-                            header_idx = i
-                            break
-                    else:
-                        header_idx = 0
-                    md_table = "\n".join(lines[header_idx:])
-                    extracted_df = pd.read_csv(io.StringIO(md_table), sep="|").dropna(axis=1, how="all")
-                    # Clean up: drop index column if present from markdown output
-                    if extracted_df.columns[0].strip() == "":
-                        extracted_df = extracted_df.iloc[:, 1:]
-            except Exception:
-                pass
-
-        if extracted_df is not None and not extracted_df.empty:
-            extracted_lists.append(extracted_df)
-            return f"Successfully extracted ranked list from {url}:\n{extracted_df.to_string(index=False)}"
-        else:
-            # Save the LLM output text anyway, could combine later
-            extracted_lists.append(llm_response)
-            return f"LLM extracted from {url}:\n{llm_response}"
-
-    except Exception as e:
-        return f"Error extracting list from {url}: {str(e)}"
+import requests
+from bs4 import BeautifulSoup
 
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")  # Use OpenAI key
@@ -97,131 +17,187 @@ llm = ChatOpenAI(
     model="gpt-4o"
 )
 
-@tool
-def search_web(query: str) -> str:
-    """
-    Search the web using DuckDuckGo's direct API (duckduckgo-search library) for information about a topic.
-    Returns search results as a formatted string with URLs and snippets.
+def get_duckduckgo_links(query, n_results=10):
+    """Use DDGS to get a set of result links for a topic."""
+    links = []
+    with DDGS() as ddgs:
+        for result in ddgs.text(query, max_results=n_results):
+            url = result.get('href') or result.get('url')
+            if url and url.startswith("http"):
+                links.append({'title': result.get('title', ''), 'url': url, 'snippet': result.get('body', '')})
+            if len(links) >= n_results:
+                break
+    return links
 
-    Args:
-        query: The search query to execute
-
-    Returns:
-        A string containing search results with URLs and descriptions
-    """
+def scrape_title_desc(url, timeout=10):
+    """Try to get the <title> and first meta/description from the page to help the agent."""
     try:
-        # Use DuckDuckGo search directly via the ddgs library
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=10))
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+        desc = ""
+        descmeta = soup.find("meta", attrs={"name": "description"})
+        if descmeta and descmeta.get("content"):
+            desc = descmeta["content"].strip()
+        if not desc:
+            ogdesc = soup.find("meta", attrs={"property": "og:description"})
+            if ogdesc and ogdesc.get("content"):
+                desc = ogdesc["content"].strip()
+        return title, desc
+    except Exception:
+        return "", ""
 
-        if results and len(results) > 0:
-            formatted_results = []
-            for i, result in enumerate(results, 1):
-                title = result.get('title', 'No title')
-                url = result.get('href', result.get('url', 'No URL'))
-                body = result.get('body', result.get('snippet', 'No description'))
-                formatted_results.append(f"{i}. {title}\n   URL: {url}\n   {body}\n")
-            return "\n".join(formatted_results)
+def extract_and_parse_lists(topic: str, n_lists: int = 5) -> list:
+    """
+    Use DuckDuckGo to find links, then let GPT-4o with the extracted URLs
+    produce/normalize n_lists top lists for a topic.
+    Returns: list of pd.DataFrame objects, all with columns: item, rank, source
+    """
+    search_links = get_duckduckgo_links(f"greatest {topic} of all time ranked list", n_results=n_lists * 2)
+
+    # Optionally, pass title/desc to help the agent, and filter out likely irrelevant links
+    enriched = []
+    for link in search_links:
+        title, desc = scrape_title_desc(link["url"])
+        if title or desc:
+            enriched.append({
+                "url": link["url"],
+                "title": title or link["title"],
+                "snippet": desc or link["snippet"]
+            })
         else:
-            return f"Search completed but no results found for: '{query}'. Try a more specific search query or different keywords."
+            enriched.append(link)
+        if len(enriched) >= n_lists:
+            break
 
-    except Exception as e:
-        error_msg = str(e)
-        return f"Error searching DuckDuckGo for '{query}': {error_msg}. Please try again with a different query."
+    if not enriched:
+        return []
 
-# Set up tools
-tools = [search_web, extract_list_from_url]
+    # Construct prompt including the found URLs
+    sources_prompt = "\n".join([
+        f"- URL: {x['url']}\n  Title: {x.get('title','')}\n  Desc/Snippet: {x.get('snippet','')}" for x in enriched[:n_lists]
+    ])
 
-# Use classic LangChain agent since LangGraph's create_react_agent raises an import error
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-    verbose=True,
-    handle_parsing_errors="Check if the tool input is a valid string or a URL."
-)
+    prompt = f"""
+You are a top-list aggregation assistant.
+
+INSTRUCTIONS:
+- Given the following search results containing likely sources of ranked or scored lists about '{topic}', pick the {n_lists} best, reputable, independent sources.
+- For each, visit the source (from the URL) and extract its actual ranked or scored list (e.g., top X {topic}); output as a markdown table with columns: 'item' and 'rank' (with 1 always meaning 'best').
+- The table must contain at least 5 items if present.
+- If the list uses a float/integer score or rating instead of rank, use that in the 'rank' column.
+- Clarify if a higher or lower number is better.
+- Do NOT make up or guess data: You must only reflect what's actually present in the list/table found in the page at the given URL. Output nothing if you cannot find a real list for a source.
+- Only provide a table and the source for each, nothing else.
+
+SOURCES TO USE:
+{sources_prompt}
+
+OUTPUT FORMAT:
+For each list:
+Source: <URL>
+| item | rank |
+|-------------------|-------|
+| ... | ... |
+"""
+
+    # LLM call, no tool use (it gets the real URLs/snippets in the prompt, so agent must do extraction/format)
+    response = llm.invoke([HumanMessage(content=prompt)])
+    content = getattr(response, "content", None)
+    if content is None and hasattr(response, "message"):
+        content = response.message.content
+    if content is None:
+        raise RuntimeError("No content returned from GPT-4o call.")
+
+    # Parse markdown tables from the response, as before
+    import re
+    import io
+
+    blocks = re.split(r'(?=Source\s*:)', content)
+    extracted_lists = []
+    for block in blocks:
+        url_match = re.search(r"Source\s*:\s*(\S+)", block)
+        md_table_match = re.search(
+            r"(\|+\s*item\s*\|+\s*rank\s*\|.*?)(?:\n\s*\n|\Z)", block, re.DOTALL | re.IGNORECASE
+        )
+        if url_match and md_table_match:
+            url = url_match.group(1).strip()
+            md_table = md_table_match.group(1).strip()
+            md_lines = [line.strip() for line in md_table.splitlines() if "|" in line]
+            if not md_lines:
+                continue
+            # Make sure the first header line and second separator line start with '|'
+            if not md_lines[0].startswith("|"):
+                md_lines[0] = "|" + md_lines[0]
+            if len(md_lines) > 1 and not md_lines[1].startswith("|"):
+                md_lines[1] = "|" + md_lines[1]
+            # Only keep rows with at least two columns (to filter out empty/invalid tables)
+            filtered_lines = []
+            for line in md_lines:
+                if line.count("|") >= 2:
+                    filtered_lines.append(line)
+            md_table_cleaned = "\n".join(filtered_lines)
+            try:
+                df = pd.read_csv(io.StringIO(md_table_cleaned), sep="|", engine='python')
+                # Remove all-whitespace and unnamed columns
+                df = df.loc[:, [c for c in df.columns if str(c).strip() and not str(c).lower().startswith('unnamed')]]
+                df.columns = [c.strip().lower() for c in df.columns]
+                if 'item' in df.columns and 'rank' in df.columns:
+                    pre_row_count = len(df)
+                    df = df.dropna(subset=['item', 'rank'])
+                    # Remove rows where item is empty string or rank is empty
+                    df = df[df['item'].astype(str).str.strip() != ""]
+                    df = df[df['rank'].astype(str).str.strip() != ""]
+                    # Remove duplicate header/separator rows that some LLMs include in body
+                    df = df[~df['item'].str.lower().isin(['item', '---', '———————', ''])]
+                    df = df[~df['rank'].str.lower().isin(['rank', '---', '———', ''])]
+                    # --- BEGIN PATCH: Remove first row if it's just dashes ---
+                    if len(df) > 0:
+                        first_row_val = df.iloc[0].astype(str).apply(lambda s: s.strip())
+                        # Check if all columns in first row are dashes
+                        if all(re.fullmatch(r"-+", v) for v in first_row_val):
+                            df = df.iloc[1:]
+                    # --- END PATCH ---
+                    post_row_count = len(df)
+                    if post_row_count > 0:
+                        df['source'] = url
+                        extracted_lists.append(df[['item', 'rank', 'source']])
+            except Exception as e:
+                continue
+    return extracted_lists
 
 user_topic = st.text_input("Enter a topic for top lists:")
 
 if user_topic and st.button("Find and Aggregate Top Lists"):
-    # Reset extracted lists
-    extracted_lists.clear()
-
-    # Use agent to find and extract top lists
-    user_prompt = (
-        f"Find websites that contain high-quality top lists on the topic '{user_topic}'. "
-        f"Search for reputable sources like Wikipedia, news articles, or ranking sites. "
-        f"For at least 3-5 relevant URLs, fetch their content and extract any ranked/top lists directly from the content, even if they are not tables. "
-        f"Attempt to return any ranked list as structured markdown tables (with item and ranking or score columns, if possible)."
-    )
-
-    with st.spinner("Agent is searching and extracting data..."):
-        # Use agent to respond to user_prompt
+    with st.spinner("Searching via DuckDuckGo and extracting lists with GPT-4o..."):
         try:
-            result = agent({"input": user_prompt})
+            dfs = extract_and_parse_lists(user_topic)
         except Exception as e:
-            result = {"output": f"Agent failed due to: {str(e)}"}
+            st.write(f"Failed: {e}")
+            dfs = []
 
-    st.write("Agent Response:")
-    # Write the agent's output (zero-shot agent)
-    if isinstance(result, dict) and "output" in result:
-        st.write(result["output"])
-    else:
-        st.write(str(result))
+    if dfs:
+        # Only aggregate if we actually have non-empty frames
+        non_empty = [df[['item', 'rank']] for df in dfs if df is not None and not df.empty]
+        if non_empty:
+            combined = pd.concat(non_empty)
+            combined['rank'] = pd.to_numeric(combined['rank'], errors='coerce')
+            agg = combined.groupby('item', as_index=False)['rank'].mean().dropna().sort_values('rank')
+            agg.columns = ['item', 'average_rank']
 
-    # Display extracted lists
-    if extracted_lists:
+            st.write("---")
+            st.write("### Aggregated List by Average Rank")
+            st.dataframe(agg)
+        else:
+            st.info("No lists with extracted data found. (Check if the topic yields usable ranked lists!)")
+
         st.write("---")
         st.write("### Extracted Lists:")
-        for i, table in enumerate(extracted_lists, 1):
-            st.write(f"**Extracted {i}:**")
-            if isinstance(table, pd.DataFrame):
-                st.dataframe(table)
-            else:
-                st.write(table)
-
-        # Attempt to aggregate only the DataFrames
-        dfs = [table for table in extracted_lists if isinstance(table, pd.DataFrame)]
-        if len(dfs) > 1:
-            st.write("---")
-            st.write("### Aggregated List:")
-            import numpy as np
-
-            def find_ranking_col(df):
-                number_cols = df.select_dtypes(include=np.number).columns.tolist()
-                if number_cols:
-                    return number_cols[0]
-                for col in df.columns:
-                    if any(kw in str(col).lower() for kw in ['rank', 'score', 'points', 'position']):
-                        return col
-                return None
-
-            merged = None
-            for i, df in enumerate(dfs):
-                name_col = None
-                # Try to find column likely to be the entity/item
-                object_cols = [c for c in df.columns if df[c].dtype == object]
-                if object_cols:
-                    name_col = object_cols[0]
-                else:
-                    name_col = df.columns[0]
-                rank_col = find_ranking_col(df)
-                use_df = df[[name_col, rank_col]].copy() if rank_col and rank_col in df.columns else df[[name_col]].copy()
-                use_df = use_df.rename(columns={name_col: "item", rank_col: f"rank_{i}" if rank_col else f"score_{i}"})
-                if merged is None:
-                    merged = use_df
-                else:
-                    merged = pd.merge(merged, use_df, on="item", how="outer")
-
-            if merged is not None and len(merged) > 0:
-                rank_cols = [c for c in merged.columns if 'rank' in c or 'score' in c]
-                if rank_cols:
-                    merged['average'] = merged[rank_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1)
-                    merged_sorted = merged.sort_values('average')
-                    st.dataframe(merged_sorted[['item', 'average'] + rank_cols])
-                else:
-                    st.dataframe(merged)
+        for i, df in enumerate(dfs, 1):
+            if df is not None and not df.empty:
+                st.write(f"**Extracted {i}:** (Source: {df['source'].iloc[0]})")
+                st.dataframe(df[['item', 'rank']])
     else:
-        st.info("No lists were extracted. The agent may need to search for more specific URLs.")
+        st.info("No lists extracted. (Check if the topic yields relevant sources!)")
 else:
     st.info("Enter a topic to get top lists.")
