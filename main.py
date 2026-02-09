@@ -5,18 +5,15 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from ddgs import DDGS
-
 import requests
 from bs4 import BeautifulSoup
 
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")  # Use OpenAI key
-
 llm = ChatOpenAI(
     openai_api_key=openai_api_key,
     model="gpt-4o"
 )
-
 def get_duckduckgo_links(query, n_results=10):
     """Use DDGS to get a set of result links for a topic."""
     links = []
@@ -28,7 +25,6 @@ def get_duckduckgo_links(query, n_results=10):
             if len(links) >= n_results:
                 break
     return links
-
 def scrape_title_desc(url, timeout=10):
     """Try to get the <title> and first meta/description from the page to help the agent."""
     try:
@@ -46,7 +42,6 @@ def scrape_title_desc(url, timeout=10):
         return title, desc
     except Exception:
         return "", ""
-
 def extract_and_parse_lists(topic: str, n_lists: int = 5) -> list:
     """
     Use DuckDuckGo to find links, then let GPT-4o with the extracted URLs
@@ -54,7 +49,6 @@ def extract_and_parse_lists(topic: str, n_lists: int = 5) -> list:
     Returns: list of pd.DataFrame objects, all with columns: item, rank, source
     """
     search_links = get_duckduckgo_links(f"greatest {topic} of all time ranked list", n_results=n_lists * 2)
-
     # Optionally, pass title/desc to help the agent, and filter out likely irrelevant links
     enriched = []
     for link in search_links:
@@ -69,15 +63,12 @@ def extract_and_parse_lists(topic: str, n_lists: int = 5) -> list:
             enriched.append(link)
         if len(enriched) >= n_lists:
             break
-
     if not enriched:
         return []
-
     # Construct prompt including the found URLs
     sources_prompt = "\n".join([
         f"- URL: {x['url']}\n  Title: {x.get('title','')}\n  Desc/Snippet: {x.get('snippet','')}" for x in enriched[:n_lists]
     ])
-
     prompt = f"""
 You are a top-list aggregation assistant.
 
@@ -100,7 +91,6 @@ Source: <URL>
 |-------------------|-------|
 | ... | ... |
 """
-
     # LLM call, no tool use (it gets the real URLs/snippets in the prompt, so agent must do extraction/format)
     response = llm.invoke([HumanMessage(content=prompt)])
     content = getattr(response, "content", None)
@@ -108,11 +98,9 @@ Source: <URL>
         content = response.message.content
     if content is None:
         raise RuntimeError("No content returned from GPT-4o call.")
-
     # Parse markdown tables from the response, as before
     import re
     import io
-
     blocks = re.split(r'(?=Source\s*:)', content)
     extracted_lists = []
     for block in blocks:
@@ -165,9 +153,7 @@ Source: <URL>
             except Exception as e:
                 continue
     return extracted_lists
-
 user_topic = st.text_input("Enter a topic for top lists:")
-
 if user_topic and st.button("Find and Aggregate Top Lists"):
     with st.spinner("Searching via DuckDuckGo and extracting lists with GPT-4o..."):
         try:
@@ -175,7 +161,6 @@ if user_topic and st.button("Find and Aggregate Top Lists"):
         except Exception as e:
             st.write(f"Failed: {e}")
             dfs = []
-
     if dfs:
         # Only aggregate if we actually have non-empty frames
         non_empty = [df[['item', 'rank']] for df in dfs if df is not None and not df.empty]
@@ -190,7 +175,6 @@ if user_topic and st.button("Find and Aggregate Top Lists"):
             st.dataframe(agg)
         else:
             st.info("No lists with extracted data found. (Check if the topic yields usable ranked lists!)")
-
         st.write("---")
         st.write("### Extracted Lists:")
         for i, df in enumerate(dfs, 1):
