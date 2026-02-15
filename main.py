@@ -1,28 +1,25 @@
 import streamlit as st
-import pandas as pd
+import json
 import os
 from dotenv import load_dotenv
+import pandas as pd
+from ddgs import DDGS
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langsmith import traceable
-from typing import Optional, Tuple, List, Dict, Any
-from ddgs import DDGS
 import requests
 from bs4 import BeautifulSoup
-
 import re
 import io
 
 load_dotenv()
 
-# Load LangSmith environment variables from .env lines 6-10 (see @file_context_0)
 langsmith_tracing = os.getenv("LANGSMITH_TRACING")
 langsmith_endpoint = os.getenv("LANGSMITH_ENDPOINT")
 langsmith_api_key = os.getenv("LANGSMITH_API_KEY")
 langsmith_project = os.getenv("LANGSMITH_PROJECT")
 
-# Set LangSmith tracing and config
 if langsmith_tracing:
     os.environ["LANGCHAIN_TRACING_V2"] = langsmith_tracing
 if langsmith_endpoint:
@@ -32,17 +29,14 @@ if langsmith_api_key:
 if langsmith_project:
     os.environ["LANGCHAIN_PROJECT"] = langsmith_project
 
-openai_api_key = os.getenv("OPENAI_API_KEY")  # Use OpenAI key
+openai_api_key = os.getenv("OPENAI_API_KEY")
 llm = ChatOpenAI(
     openai_api_key=openai_api_key,
     model="gpt-4o"
 )
 
-# --- Tool definitions ---
-
 @tool("duckduckgo_search", return_direct=False)
-def ddg_tool(query: str, max_results: int = 25) -> List[Dict[str, str]]:
-    """Search DuckDuckGo for top results. Returns a list of dicts with title, url, snippet."""
+def ddg_tool(query: str, max_results: int = 25):
     links = []
     with DDGS() as ddgs:
         for result in ddgs.text(query, max_results=max_results):
@@ -54,7 +48,6 @@ def ddg_tool(query: str, max_results: int = 25) -> List[Dict[str, str]]:
     return links
 
 def _get_preceding_context(elem, soup, max_prev=3) -> str:
-    """Get headings and text from elements preceding this one (siblings or ancestors)."""
     context = []
     prev = elem.find_previous_siblings(limit=max_prev)
     for s in reversed(prev):
@@ -63,7 +56,6 @@ def _get_preceding_context(elem, soup, max_prev=3) -> str:
             context.append(f"  [{s.name}]: {t}")
         elif s.name == "caption" and t:
             context.append(f"  [caption]: {t}")
-    # Check parent section
     parent = elem.parent
     for _ in range(2):
         if parent and parent.name:
@@ -79,7 +71,6 @@ def _get_preceding_context(elem, soup, max_prev=3) -> str:
     return "\n".join(context) if context else ""
 
 def _get_html_snippet(elem, max_len: int = 2000) -> str:
-    """Get raw HTML for element and its children, truncated."""
     html = str(elem)
     if len(html) > max_len:
         html = html[:max_len] + "\n... [truncated]"
@@ -87,14 +78,11 @@ def _get_html_snippet(elem, max_len: int = 2000) -> str:
 
 @tool("extract_page_data", return_direct=False)
 def extract_page_data_tool(url: str, timeout: int = 10, include_html: bool = True) -> str:
-    """Extract data from a webpage: tables and lists with surrounding context (headings, captions, container classes) and optionally the raw HTML markup for each block."""
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         parts = []
-
-        # Extract HTML tables with context
         table_elems = soup.find_all("table")
         for i, table in enumerate(table_elems[:5]):
             try:
@@ -111,8 +99,6 @@ def extract_page_data_tool(url: str, timeout: int = 10, include_html: bool = Tru
             if include_html:
                 block += "HTML snippet:\n```html\n" + _get_html_snippet(table) + "\n```\n"
             parts.append(block)
-
-        # Ordered lists with context
         for i, ol in enumerate(soup.find_all("ol", limit=5)):
             items = [li.get_text(strip=True) for li in ol.find_all("li", recursive=False) if li.get_text(strip=True)]
             if len(items) < 3:
@@ -125,8 +111,6 @@ def extract_page_data_tool(url: str, timeout: int = 10, include_html: bool = Tru
             if include_html:
                 block += "HTML snippet:\n```html\n" + _get_html_snippet(ol) + "\n```\n"
             parts.append(block)
-
-        # Unordered lists
         for i, ul in enumerate(soup.find_all("ul", limit=3)):
             items = [li.get_text(strip=True) for li in ul.find_all("li", recursive=False) if li.get_text(strip=True)]
             if len(items) < 5:
@@ -139,10 +123,8 @@ def extract_page_data_tool(url: str, timeout: int = 10, include_html: bool = Tru
             if include_html:
                 block += "HTML snippet:\n```html\n" + _get_html_snippet(ul) + "\n```\n"
             parts.append(block)
-
         if parts:
             return "Extracted data from page:\n\n" + "\n".join(parts)
-        # Fallback: extract main text (many sites use JS or custom markup for lists)
         for selector in ["article", "main", ".content", ".article-body"]:
             try:
                 els = soup.select(selector)
@@ -161,75 +143,153 @@ def extract_page_data_tool(url: str, timeout: int = 10, include_html: bool = Tru
     except Exception as e:
         return f"Error extracting page data: {e}"
 
-# --- Deterministic extraction: search all URLs, extract all, LLM parses each ---
+def _parse_llm_list_output(content: str, parsed_url: str):
+    md_table_match = re.search(
+        r"(\|+(?:.+\|)+\n(?:\|.+\|.*\n)+)", content
+    )
+    if not md_table_match:
+        return None
+    md_table = md_table_match.group(1).strip()
+    md_lines = [line.strip() for line in md_table.splitlines() if "|" in line and line.count("|") >= 2]
+    if len(md_lines) < 2:
+        return None
+    if not md_lines[0].startswith("|"):
+        md_lines[0] = "|" + md_lines[0]
+    md_table_cleaned = "\n".join(md_lines)
+    try:
+        df = pd.read_csv(io.StringIO(md_table_cleaned), sep="|", engine='python')
+        df = df.loc[:, [c for c in df.columns if str(c).strip() and not str(c).lower().startswith('unnamed')]]
+        df.columns = [c.strip().lower() for c in df.columns]
+        col0, col1 = df.columns[0], df.columns[1]
+        item_col = next((c for c in df.columns if str(c).lower() in ("item","name","title","movie","song","game","entry")), col0)
+        rank_col = next((c for c in df.columns if str(c).lower() in ("rank","#","position","no","no.","number") or "rank" in str(c).lower() or "#" in str(c)), col1)
+        df = df.rename(columns={item_col: "item", rank_col: "rank"})
+        if 'item' in df.columns and 'rank' in df.columns:
+            df = df.dropna(subset=['item', 'rank'])
+            df = df[df['item'].astype(str).str.strip() != ""]
+            df = df[df['rank'].astype(str).str.strip() != ""]
+            df = df[~df['item'].str.lower().isin(['item', '---', '———————', ''])]
+            df = df[~df['rank'].str.lower().isin(['rank', '---', '———', ''])]
+            if len(df) > 0:
+                first_row_val = df.iloc[0].astype(str).apply(lambda s: s.strip())
+                if all(re.fullmatch(r"-+", v) for v in first_row_val):
+                    df = df.iloc[1:]
+            if len(df) > 0:
+                df = df.copy()
+                df['source'] = parsed_url
+                return df[['item', 'rank', 'source']]
+    except Exception:
+        return None
+    return None
 
 def _format_lists_for_aggregation(dfs: list) -> str:
-    """Format extracted DataFrames for the aggregation prompt."""
     parts = []
-    for i, df in enumerate(dfs):
+    for df in dfs:
         if df is None or df.empty:
             continue
-        source = df["source"].iloc[0] if "source" in df.columns else "unknown"
-        parts.append(f"List {i + 1} (Source: {source}):\n" + df[["item", "rank"]].to_string(index=False) + "\n")
-    return "\n".join(parts)
+        src = df['source'].iloc[0] if 'source' in df.columns else "unknown"
+        srcblock = f"Source: {src}\n| item | rank |\n|------|------|\n"
+        for _, row in df.iterrows():
+            srcblock += f"| {row['item']} | {row['rank']} |\n"
+        parts.append(srcblock.strip())
+    return "\n\n".join(parts)
 
-def agent_aggregate_lists(dfs: list, topic: str, llm):
+def _parse_markdown_table_to_df(md_content: str):
     """
-    Use the LLM to aggregate multiple ranked lists into a single consensus ranking.
-    Returns a string (markdown table) and optionally a DataFrame.
+    Parses markdown table from a string and returns a DataFrame with columns ['rank', 'item'] if possible.
     """
-    if not dfs or all(df is None or df.empty for df in dfs):
-        return None, "No lists to aggregate."
-    
-    formatted = _format_lists_for_aggregation(dfs)
-    prompt = f"""You are an expert at synthesizing rankings from multiple sources.
+    md_table_match = re.search(
+        r"(\|+\s*rank\s*\|\s*item\s*\|.*(?:\|.*\|.*\n?)+)", md_content, re.IGNORECASE
+    )
+    if not md_table_match:
+        return None
 
-You have {len([d for d in dfs if d is not None and not d.empty])} ranked lists about "{topic}". 
-Aggregate them into a single consensus ranking. Consider:
-- Items that appear in more lists should generally rank higher
-- Average rank across lists
-- Consistency of placement
+    md_table = md_table_match.group(1).strip()
+    md_lines = [line.strip() for line in md_table.splitlines() if "|" in line and line.count("|") >= 2]
+    if len(md_lines) < 2:
+        return None
 
-Output a single markdown table with columns: rank, item, num_sources, avg_rank
-Order by consensus score (best first). Include at least the top 15-20 items.
+    if not md_lines[0].startswith("|"):
+        md_lines[0] = "|" + md_lines[0]
+    md_table_cleaned = "\n".join(md_lines)
+    try:
+        df = pd.read_csv(io.StringIO(md_table_cleaned), sep="|", engine='python')
+        df = df.loc[:, [c for c in df.columns if str(c).strip() and not str(c).lower().startswith('unnamed')]]
+        df.columns = [c.strip().lower() for c in df.columns]
+        if "rank" in df.columns and "item" in df.columns:
+            return df[["rank", "item"]]
+        else:
+            return None
+    except Exception:
+        return None
 
-Input lists:
-{formatted}
+def agent_aggregate_lists(list_dfs: list, topic: str, llm, status_placeholder):
+    """
+    Perform aggregation of lists using an LLM agent.
+    Passes all lists (markdown) in one prompt and asks LLM to output a single
+    consensus markdown table with only columns: rank and item, ordered as the agent decides.
+    Returns the result as a DataFrame.
+    """
+    aggregation_prompt = f"""You are an expert at synthesizing rankings from multiple sources.
 
-Output format (strict markdown table):
-| rank | item | num_sources | avg_rank |
-|------|------|-------------|----------|
-| 1 | ... | ... | ... |
+You are given multiple lists about "{topic}". Each list comes from a different source.
+Aggregate these lists into a single consensus ranking as you see fit, using your own best method.
+
+Output a single markdown table with columns: rank, item.
+
+Order by your consensus score (best first). Include at least the top 15-20 items.
+
+Input lists (each starts with a Source line):
+
+{_format_lists_for_aggregation(list_dfs)}
+
+Respond ONLY with the table in markdown (NO intro sentence, NO comments):
+
+| rank | item |
+|------|------|
+| 1 | ... |
 """
-    response = llm.invoke([HumanMessage(content=prompt)])
-    content = response.content if hasattr(response, "content") else str(response)
-    return content, content
+    status_placeholder.caption("Aggregating lists (via agent LLM)...")
+    try:
+        response = llm.invoke([HumanMessage(content=aggregation_prompt)])
+        table_markdown = response.content if hasattr(response, "content") else str(response)
+
+        # Parse agent output into DataFrame (required by instructions)
+        df = _parse_markdown_table_to_df(table_markdown)
+        if df is not None:
+            return df
+        else:
+            # If parsing fails, return an empty DataFrame with columns
+            return pd.DataFrame(columns=["rank", "item"])
+    except Exception as e:
+        # On agent error, return an empty DataFrame for consistent output
+        return pd.DataFrame(columns=["rank", "item"])
 
 @traceable(name="wordlister_pipeline")
-def extract_and_parse_lists(topic: str, llm, status_placeholder=None) -> tuple:
+def extract_and_parse_lists(topic: str) -> list:
     """
+    every URL. 3) Use LLM to parse each page's data into item|rank format.
+    Returns: list of pd.DataFrame objects with columns: item, rank, source
     Deterministically: 1) Search DuckDuckGo for all URLs. 2) Extract page data from
     every URL. 3) Use LLM to parse each page. 4) Use LLM to aggregate lists.
-    Returns: (list of DataFrames, aggregated_markdown_string)
+    Returns: (list of DataFrames, aggregated_output) where aggregated_output is a DataFrame.
     """
+    status_placeholder = st.empty()
     search_query = f"top {topic} ranked list best of all time"
-    
-    # 1. Get ALL search results (no agent - we control this)
     urls_to_process = []
     with DDGS() as ddgs:
         for result in ddgs.text(search_query, max_results=25):
             url = result.get("href") or result.get("url")
-            if url and url.startswith("http") and url not in [u["url"] for u in urls_to_process]:
-                urls_to_process.append({"url": url, "title": result.get("title", "")})
-    
-    if not urls_to_process:
-        raise RuntimeError("No URLs found from DuckDuckGo search.")
-    
-    if status_placeholder is None:
-        status_placeholder = st.empty()
-    
+            if (
+                url
+                and url.startswith("http")
+                and url not in [u["url"] for u in urls_to_process]
+            ):
+                urls_to_process.append(
+                    {"url": url, "title": result.get("title", "")}
+                )
     extracted_lists = []
-    prompt_template = """Extract the primary ranked/list data from this webpage about "{topic}".
+    extract_prompt_template = """Extract the primary ranked/list data from this webpage about "{topic}".
 The data may be in tables, ordered lists, or numbered text. Output a markdown table with columns "item" and "rank" (rank 1 = best).
 If you cannot find any ranked list with at least 3 items, respond with exactly: NONE
 
@@ -241,109 +301,78 @@ Source: {url}
 | Item2 | 2 |
 | ... | ... |
 """
-    
-    # 2. Extract data from EACH URL, then LLM-parse each
     for idx, entry in enumerate(urls_to_process):
         url = entry["url"]
         status_placeholder.caption(f"Processing {idx + 1}/{len(urls_to_process)}...")
         try:
             raw_data = extract_page_data_tool.invoke({"url": url})
-        except Exception:
+        except Exception as e:
             continue
-        
         if raw_data.strip().endswith("on this page.") and "No tables or lists" in raw_data:
             continue
-        
-        # 3. LLM parses this page's data into item|rank format
-        user_msg = prompt_template.format(topic=topic, url=url) + "\n\nExtracted data:\n" + raw_data[:8000]  # Truncate if huge
+        parse_prompt = extract_prompt_template.format(topic=topic, url=url) + "\n\nExtracted data:\n" + raw_data[:8000]
         try:
-            response = llm.invoke([HumanMessage(content=user_msg)])
+            response = llm.invoke([HumanMessage(content=parse_prompt)])
             content = response.content if hasattr(response, "content") else str(response)
-        except Exception:
+        except Exception as e:
             continue
-        
         first_line = content.strip().split("\n")[0].strip().upper()
         if first_line == "NONE" or content.strip().upper().startswith("NONE"):
             continue
-        
-        # 4. Parse the LLM output
+        # parse markdown table for aggregation and for user
         blocks = re.split(r"(?=Source\s*:)", content)
         for block in blocks:
             url_match = re.search(r"Source\s*:\s*(\S+)", block)
-            md_table_match = re.search(
-                r"(\|+[^\n]+\|+[^\n]+\|[^\n]*\n(?:\|[^\n]+\|[^\n]+\|[^\n]*\n)+)",
-                block
-            ) or re.search(
-                r"(\|+\s*(?:item|name|title)\s*\|+\s*(?:rank|#|position)\s*\|.*?)(?:\n\s*\n|\Z)",
-                block, re.DOTALL | re.IGNORECASE
-            )
-            if not url_match or not md_table_match:
+            if not url_match:
                 continue
             parsed_url = url_match.group(1).strip()
-            md_table = md_table_match.group(1).strip()
-            md_lines = [line.strip() for line in md_table.splitlines() if "|" in line and line.count("|") >= 2]
-            if len(md_lines) < 2:
-                continue
-            if not md_lines[0].startswith("|"):
-                md_lines[0] = "|" + md_lines[0]
-            md_table_cleaned = "\n".join(md_lines)
-            try:
-                df = pd.read_csv(io.StringIO(md_table_cleaned), sep="|", engine='python')
-                df = df.loc[:, [c for c in df.columns if str(c).strip() and not str(c).lower().startswith('unnamed')]]
-                df.columns = [c.strip().lower() for c in df.columns]
-                # Map common column names to item/rank; fallback to first two columns
-                if len(df.columns) < 2:
-                    continue
-                col0, col1 = df.columns[0], df.columns[1]
-                item_col = next((c for c in df.columns if str(c).lower() in ("item","name","title","movie","song","game","entry")), col0)
-                rank_col = next((c for c in df.columns if str(c).lower() in ("rank","#","position","no","no.","number") or "rank" in str(c).lower() or "#" in str(c)), col1)
-                df = df.rename(columns={item_col: "item", rank_col: "rank"})
-                if 'item' in df.columns and 'rank' in df.columns:
-                    df = df.dropna(subset=['item', 'rank'])
-                    df = df[df['item'].astype(str).str.strip() != ""]
-                    df = df[df['rank'].astype(str).str.strip() != ""]
-                    df = df[~df['item'].str.lower().isin(['item', '---', '———————', ''])]
-                    df = df[~df['rank'].str.lower().isin(['rank', '---', '———', ''])]
-                    if len(df) > 0:
-                        first_row_val = df.iloc[0].astype(str).apply(lambda s: s.strip())
-                        if all(re.fullmatch(r"-+", v) for v in first_row_val):
-                            df = df.iloc[1:]
-                    if len(df) > 0:
-                        df = df.copy()
-                        df['source'] = parsed_url
-                        extracted_lists.append(df[['item', 'rank', 'source']])
-            except Exception:
-                continue
+            df = _parse_llm_list_output(block, parsed_url)
+            if df is not None and not df.empty:
+                extracted_lists.append(df)
     status_placeholder.empty()
-    
-    # Agent aggregation (LLM aggregates all lists into one consensus ranking)
-    status_placeholder.caption("Aggregating lists...")
-    aggregated_str, _ = agent_aggregate_lists(extracted_lists, topic, llm)
+    if extracted_lists:
+        status_placeholder.caption("Aggregating lists...")
+        aggregated_df = agent_aggregate_lists(extracted_lists, topic, llm, status_placeholder)
+        status_placeholder.empty()
+        return extracted_lists, aggregated_df
     status_placeholder.empty()
+    # Return aggregated_output as empty DataFrame for API contract
+    return extracted_lists, pd.DataFrame(columns=["rank", "item"])
+
+st.title("Find and Aggregate Top Lists")
+
+col1, col2 = st.columns([3,1])
+with col1:
+    user_topic = st.text_input("Enter a topic for top lists:", placeholder="e.g. movies, albums, books")
+with col2:
+    do_find = st.button("Find and Aggregate Top Lists")
     
-    return extracted_lists, aggregated_str
+if 'do_find' not in locals():
+    do_find = False
 
-user_topic = st.text_input("Enter a topic for top lists:", placeholder="e.g. movies, albums, books")
-find_clicked = st.button("Find and Aggregate Top Lists")
-
-if find_clicked:
+if do_find:
     if not user_topic or not user_topic.strip():
         st.warning("Please enter a topic first.")
     else:
-        status_ph = st.empty()
-        with st.spinner("Searching, extracting, parsing, and aggregating..."):
+        with st.spinner("Searching, extracting, and parsing all URLs..."):
             try:
-                dfs, aggregated_str = extract_and_parse_lists(user_topic.strip(), llm, status_ph)
+                dfs, aggregated_result = extract_and_parse_lists(user_topic.strip())
             except Exception as e:
                 st.write(f"Failed: {e}")
                 dfs = []
-                aggregated_str = None
-
+                aggregated_result = pd.DataFrame(columns=["rank", "item"])
         if dfs:
-            if aggregated_str:
+            non_empty = [df[['item', 'rank']] for df in dfs if df is not None and not df.empty]
+            if non_empty:
                 st.write("---")
                 st.write("### Aggregated List (Agent Consensus)")
-                st.markdown(aggregated_str)
+                if aggregated_result is not None and isinstance(aggregated_result, pd.DataFrame):
+                    if not aggregated_result.empty:
+                        st.dataframe(aggregated_result)
+                    else:
+                        st.info("No aggregate list found.")
+                else:
+                    st.info("No aggregate list found.")
             st.write("---")
             st.write("### Extracted Lists:")
             for i, df in enumerate(dfs, 1):
@@ -351,6 +380,6 @@ if find_clicked:
                     st.write(f"**Extracted {i}:** (Source: {df['source'].iloc[0]})")
                     st.dataframe(df[['item', 'rank']])
         else:
-            st.info("No lists extracted. Try a different topic or check your connection.")
+            st.info("No lists extracted. (Check if the topic yields relevant sources!)")
 else:
     st.info("Enter a topic and click **Find and Aggregate Top Lists** to start.")
