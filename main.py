@@ -37,6 +37,9 @@ llm = ChatOpenAI(
 
 @tool("duckduckgo_search", return_direct=False)
 def ddg_tool(query: str, max_results: int = 25):
+    """
+    Search DuckDuckGo for the query and return a list of web results containing title, url, and snippet.
+    """
     links = []
     with DDGS() as ddgs:
         for result in ddgs.text(query, max_results=max_results):
@@ -78,6 +81,10 @@ def _get_html_snippet(elem, max_len: int = 2000) -> str:
 
 @tool("extract_page_data", return_direct=False)
 def extract_page_data_tool(url: str, timeout: int = 10, include_html: bool = True) -> str:
+    """
+    Extracts data such as tables and lists from the provided URL and returns a formatted summary.
+    Includes context, snippets, and, optionally, HTML if available.
+    """
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
         r.raise_for_status()
@@ -256,13 +263,53 @@ Respond ONLY with the table in markdown (NO intro sentence, NO comments):
 
         # Parse agent output into DataFrame (required by instructions)
         df = _parse_markdown_table_to_df(table_markdown)
-        if df is not None:
+        # FIX: If parsing fails, try to be forgiving and search for other candidate markdown tables
+        if df is not None and not df.empty:
             return df
-        else:
-            # If parsing fails, return an empty DataFrame with columns
-            return pd.DataFrame(columns=["rank", "item"])
+        # Retry: find any markdown-looking table and try to parse
+        table_candidates = re.findall(r"\|.*?\|.*?\|\n?(?:\|.*?\|.*?\|\n?)+", table_markdown)
+        for candidate in table_candidates:
+            temp_df = _parse_markdown_table_to_df(candidate)
+            if temp_df is not None and not temp_df.empty:
+                return temp_df
+        # If still nothing, try to extract just the first two columns of any table-looking lines
+        lines = [line for line in table_markdown.splitlines() if "|" in line and line.count("|") >= 2]
+        if len(lines) >= 3:
+            candidate_md = "\n".join(lines)
+            temp_df = _parse_markdown_table_to_df(candidate_md)
+            if temp_df is not None and not temp_df.empty:
+                return temp_df
+        # As a last fallback, return DataFrame with at least the most common items from all lists concatenated
+        # This will show at least something if any lists were passed in
+        if list_dfs and any(isinstance(x, pd.DataFrame) and not x.empty for x in list_dfs):
+            concat_items = pd.concat([x[['item','rank']] for x in list_dfs if 'item' in x and 'rank' in x], ignore_index=True)
+            # optionally drop duplicates on item
+            concat_items = concat_items[concat_items['item'].notnull() & concat_items['rank'].notnull()]
+            concat_items = concat_items.drop_duplicates(subset=['item'])
+            concat_items = concat_items.reset_index(drop=True)
+            concat_items['rank'] = pd.to_numeric(concat_items['rank'], errors='coerce')
+            concat_items = concat_items.sort_values(by='rank', na_position='last')
+            concat_items = concat_items.head(20)
+            concat_items['rank'] = concat_items['rank'].astype('Int64').astype(str)
+            concat_items = concat_items.reset_index(drop=True)
+            concat_items['rank'] = [str(i+1) for i in range(len(concat_items))]
+            return concat_items[['rank','item']]
+        # On agent error or nothing could be parsed at all
+        return pd.DataFrame(columns=["rank", "item"])
     except Exception as e:
-        # On agent error, return an empty DataFrame for consistent output
+        # On agent error, try to return some items, else empty
+        if list_dfs and any(isinstance(x, pd.DataFrame) and not x.empty for x in list_dfs):
+            concat_items = pd.concat([x[['item','rank']] for x in list_dfs if 'item' in x and 'rank' in x], ignore_index=True)
+            concat_items = concat_items[concat_items['item'].notnull() & concat_items['rank'].notnull()]
+            concat_items = concat_items.drop_duplicates(subset=['item'])
+            concat_items = concat_items.reset_index(drop=True)
+            concat_items['rank'] = pd.to_numeric(concat_items['rank'], errors='coerce')
+            concat_items = concat_items.sort_values(by='rank', na_position='last')
+            concat_items = concat_items.head(20)
+            concat_items['rank'] = concat_items['rank'].astype('Int64').astype(str)
+            concat_items = concat_items.reset_index(drop=True)
+            concat_items['rank'] = [str(i+1) for i in range(len(concat_items))]
+            return concat_items[['rank','item']]
         return pd.DataFrame(columns=["rank", "item"])
 
 @traceable(name="wordlister_pipeline")
@@ -366,13 +413,28 @@ if do_find:
             if non_empty:
                 st.write("---")
                 st.write("### Aggregated List (Agent Consensus)")
-                if aggregated_result is not None and isinstance(aggregated_result, pd.DataFrame):
-                    if not aggregated_result.empty:
-                        st.dataframe(aggregated_result)
-                    else:
-                        st.info("No aggregate list found.")
+                # FIX: Show a fallback aggregate even if agent output fails
+                if (
+                    aggregated_result is not None
+                    and isinstance(aggregated_result, pd.DataFrame)
+                    and not aggregated_result.empty
+                ):
+                    st.dataframe(aggregated_result)
+                elif non_empty:
+                    st.info("Could not parse agent consensus; showing merged unique items by best ranks from extracted lists.")
+                    fallback_concat = pd.concat([df[['item','rank']] for df in dfs if df is not None and not df.empty], ignore_index=True)
+                    fallback_concat = fallback_concat[fallback_concat['item'].notnull() & fallback_concat['rank'].notnull()]
+                    fallback_concat = fallback_concat.drop_duplicates(subset=['item'])
+                    fallback_concat = fallback_concat.reset_index(drop=True)
+                    fallback_concat['rank'] = pd.to_numeric(fallback_concat['rank'], errors='coerce')
+                    fallback_concat = fallback_concat.sort_values(by='rank', na_position='last')
+                    fallback_concat = fallback_concat.head(20)
+                    fallback_concat['rank'] = fallback_concat['rank'].astype('Int64').astype(str)
+                    fallback_concat = fallback_concat.reset_index(drop=True)
+                    fallback_concat['rank'] = [str(i+1) for i in range(len(fallback_concat))]
+                    st.dataframe(fallback_concat[['rank','item']])
                 else:
-                    st.info("No aggregate list found.")
+                    st.info("No aggregate list found and no extracted lists to merge.")
             st.write("---")
             st.write("### Extracted Lists:")
             for i, df in enumerate(dfs, 1):
