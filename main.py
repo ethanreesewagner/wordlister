@@ -13,7 +13,7 @@ import re
 import io
 from collections import Counter
 
-# Instead of dotenv, use Streamlit's secrets.toml for config
+# Instead of dotenv, use Streamlit's config.toml for config
 def get_secret_env(key, default=None):
     try:
         return st.secrets[key]
