@@ -1,0 +1,8 @@
+streamlit==1.39.0
+pandas==2.2.2
+ddgs==6.1.0
+langchain-openai==0.1.23
+langchain-core==0.2.38
+langsmith==0.1.125
+requests==2.32.3
+beautifulsoup4==4.12.3
