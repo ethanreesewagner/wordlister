@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import os
+from dotenv import load_dotenv
 import pandas as pd
 from ddgs import DDGS
 from langchain_openai import ChatOpenAI
@@ -16,10 +17,10 @@ from collections import Counter
 
 load_dotenv()
 
-langsmith_tracing = get_secret_env("LANGSMITH_TRACING")
-langsmith_endpoint = get_secret_env("LANGSMITH_ENDPOINT")
-langsmith_api_key = get_secret_env("LANGSMITH_API_KEY")
-langsmith_project = get_secret_env("LANGSMITH_PROJECT")
+langsmith_tracing = os.getenv("LANGSMITH_TRACING")
+langsmith_endpoint = os.getenv("LANGSMITH_ENDPOINT")
+langsmith_api_key = os.getenv("LANGSMITH_API_KEY")
+langsmith_project = os.getenv("LANGSMITH_PROJECT")
 
 if langsmith_tracing:
     os.environ["LANGCHAIN_TRACING_V2"] = langsmith_tracing
@@ -30,7 +31,7 @@ if langsmith_api_key:
 if langsmith_project:
     os.environ["LANGCHAIN_PROJECT"] = langsmith_project
 
-openai_api_key = get_secret_env("OPENAI_API_KEY")
+openai_api_key = os.getenv("OPENAI_API_KEY")
 llm = ChatOpenAI(
     openai_api_key=openai_api_key,
     model="gpt-4o"
@@ -434,12 +435,33 @@ if do_find:
 else:
     st.info("Enter a topic and click **Find and Aggregate Top Lists** to start.")
 
-import requests
-from bs4 import BeautifulSoup
-import re
-from collections import Counter
-import streamlit as st
-import pandas as pd
+def scraper(url):
+    html_content = requests.get(url).text
+    soup = BeautifulSoup(html_content, "html.parser")
+    all_text = soup.get_text()
+    text = [
+        chunk.strip().lower()
+        for chunk in re.split(
+            r'(?<=[a-z])(?=[A-Z])|[^a-zA-Z\']+', all_text
+        )
+        if chunk.strip()
+    ]
+    term_counts = Counter(text)
+    
+    return term_counts.most_common()
+
+st.write('''
+---
+Zipf's Law:''')
+st.text_input("Website", key="site")
+if st.button("Get rankings!"):
+    if st.session_state.site.startswith("http://") or st.session_state.site.startswith("https://"):
+        url = st.session_state.site
+    else:
+        url = "http://" + st.session_state.site
+    df = pd.DataFrame(scraper(url), columns=["term", "count"])
+    df = df.sort_values(by="count", ascending=False)
+    st.bar_chart(df, x="term", y="count", stack=False, horizontal=True, sort=False)
 
 def scraper(url):
     html_content = requests.get(url).text
