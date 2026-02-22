@@ -11,15 +11,10 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import io
+import requests
 from collections import Counter
 
-# Instead of dotenv, use Streamlit's config.toml for config
-def get_secret_env(key, default=None):
-    try:
-        return st.secrets[key]
-    except Exception:
-        # Fallback to environment variable or default
-        return os.getenv(key, default)
+load_dotenv()
 
 langsmith_tracing = get_secret_env("LANGSMITH_TRACING")
 langsmith_endpoint = get_secret_env("LANGSMITH_ENDPOINT")
@@ -439,6 +434,13 @@ if do_find:
 else:
     st.info("Enter a topic and click **Find and Aggregate Top Lists** to start.")
 
+import requests
+from bs4 import BeautifulSoup
+import re
+from collections import Counter
+import streamlit as st
+import pandas as pd
+
 def scraper(url):
     html_content = requests.get(url).text
     soup = BeautifulSoup(html_content, "html.parser")
@@ -454,8 +456,7 @@ def scraper(url):
     
     return term_counts.most_common()
 
-st.write('''
----
+st.write('''---
 Zipf's Law:''')
 st.text_input("Website", key="site")
 if st.button("Get rankings!"):
