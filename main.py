@@ -1,7 +1,6 @@
 import streamlit as st
 import json
 import os
-from dotenv import load_dotenv
 import pandas as pd
 from ddgs import DDGS
 from langchain_openai import ChatOpenAI
@@ -12,15 +11,20 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import io
-import requests
 from collections import Counter
 
-load_dotenv()
+# Instead of dotenv, use Streamlit's secrets.toml for config
+def get_secret_env(key, default=None):
+    try:
+        return st.secrets[key]
+    except Exception:
+        # Fallback to environment variable or default
+        return os.getenv(key, default)
 
-langsmith_tracing = os.getenv("LANGSMITH_TRACING")
-langsmith_endpoint = os.getenv("LANGSMITH_ENDPOINT")
-langsmith_api_key = os.getenv("LANGSMITH_API_KEY")
-langsmith_project = os.getenv("LANGSMITH_PROJECT")
+langsmith_tracing = get_secret_env("LANGSMITH_TRACING")
+langsmith_endpoint = get_secret_env("LANGSMITH_ENDPOINT")
+langsmith_api_key = get_secret_env("LANGSMITH_API_KEY")
+langsmith_project = get_secret_env("LANGSMITH_PROJECT")
 
 if langsmith_tracing:
     os.environ["LANGCHAIN_TRACING_V2"] = langsmith_tracing
@@ -31,7 +35,7 @@ if langsmith_api_key:
 if langsmith_project:
     os.environ["LANGCHAIN_PROJECT"] = langsmith_project
 
-openai_api_key = os.getenv("OPENAI_API_KEY")
+openai_api_key = get_secret_env("OPENAI_API_KEY")
 llm = ChatOpenAI(
     openai_api_key=openai_api_key,
     model="gpt-4o"
