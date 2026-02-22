@@ -35,21 +35,6 @@ llm = ChatOpenAI(
     model="gpt-4o"
 )
 
-@tool("duckduckgo_search", return_direct=False)
-def ddg_tool(query: str, max_results: int = 25):
-    """
-    Search DuckDuckGo for the query and return a list of web results containing title, url, and snippet.
-    """
-    links = []
-    with DDGS() as ddgs:
-        for result in ddgs.text(query, max_results=max_results):
-            url = result.get('href') or result.get('url')
-            if url and url.startswith("http"):
-                links.append({'title': result.get('title', ''), 'url': url, 'snippet': result.get('body', '')})
-            if len(links) >= max_results:
-                break
-    return links
-
 def _get_preceding_context(elem, soup, max_prev=3) -> str:
     context = []
     prev = elem.find_previous_siblings(limit=max_prev)
@@ -245,6 +230,7 @@ Aggregate these lists into a single consensus ranking as you see fit, using your
 Output a single markdown table with columns: rank, item.
 
 Order by your consensus score (best first). Include at least the top 15-20 items.
+Measure using the popularity of each item per list, and its average ranking.
 
 Input lists (each starts with a Source line):
 
@@ -320,6 +306,7 @@ def extract_and_parse_lists(topic: str) -> list:
     Deterministically: 1) Search DuckDuckGo for all URLs. 2) Extract page data from
     every URL. 3) Use LLM to parse each page. 4) Use LLM to aggregate lists.
     Returns: (list of DataFrames, aggregated_output) where aggregated_output is a DataFrame.
+    KEEP IT IN THE ORIGINAL ORDER
     """
     status_placeholder = st.empty()
     search_query = f"top {topic} ranked list best of all time"
