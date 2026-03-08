@@ -1,4 +1,4 @@
-streamlit==1.39.0
+streamlit
 pandas==2.2.2
 langchain-openai==0.1.23
 requests==2.32.3
@@ -7,3 +7,4 @@ python-dotenv
 tavily-python
 aiohttp
 rapidfuzz
+nest-asyncio

@@ -1,4 +1,9 @@
 import os
+
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_SERVER_PORT"] = "5000"
+os.environ["STREAMLIT_SERVER_ADDRESS"] = "0.0.0.0"
 import sys
 import logging
 import streamlit as st
@@ -12,10 +17,6 @@ from collections import defaultdict, Counter
 import textwrap
 
 # ===== Streamlit environment configuration =====
-os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
-os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
-os.environ["STREAMLIT_SERVER_PORT"] = "5000"
-os.environ["STREAMLIT_SERVER_ADDRESS"] = "0.0.0.0"
 os.environ["STREAMLIT_FIRST_RUN_DISABLED"] = "true"
 os.environ["BROWSER"] = "none"
 os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
@@ -39,15 +40,10 @@ llm_client = None
 
 def get_clients():
     global tavily_client, llm_client
-
-    # Use st.secrets from Streamlit for keys instead of os.environ / os.getenv
-    tavily_key = st.secrets.get("TAVILY_API_KEY")
-    openai_key = st.secrets.get("OPENAI_API_KEY")
-
     if tavily_client is None:
         try:
             from tavily import TavilyClient
-            tavily_client = TavilyClient(api_key=tavily_key)
+            tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
             logger.info("TavilyClient initialized")
         except Exception:
             logger.exception("TavilyClient init failed")
@@ -56,7 +52,7 @@ def get_clients():
         try:
             from langchain_openai import ChatOpenAI
             llm_client = ChatOpenAI(
-                openai_api_key=openai_key,
+                openai_api_key=os.getenv("OPENAI_API_KEY"),
                 model="gpt-4o",
                 base_url="https://models.github.ai/inference"
             )
