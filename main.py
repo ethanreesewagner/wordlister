@@ -12,16 +12,18 @@ import re
 import io
 import requests
 from collections import Counter
+from dotenv import load_dotenv
+load_dotenv()
 
 # Use st.secrets for config and secrets
-langsmith_tracing = st.secrets.get("LANGSMITH_TRACING")
-langsmith_endpoint = st.secrets.get("LANGSMITH_ENDPOINT")
-langsmith_api_key = st.secrets.get("LANGSMITH_API_KEY")
-langsmith_project = st.secrets.get("LANGSMITH_PROJECT")
+langsmith_tracing = os.getenv("LANGSMITH_TRACING")
+langsmith_api_key = os.getenv("LANGSMITH_API_KEY")
+langsmith_project = os.getenv("LANGSMITH_PROJECT")
+langsmith_endpoint = os.getenv("LANGSMITH_ENDPOINT")
 
 # No need to use os.environ
 
-openai_api_key = st.secrets.get("OPENAI_API_KEY")
+openai_api_key = os.getenv("OPENAI_API_KEY")
 llm = ChatOpenAI(
     openai_api_key=openai_api_key,
     model="gpt-4o"
@@ -467,15 +469,3 @@ def scraper(url):
     term_counts = Counter(text)
     
     return term_counts.most_common()
-
-st.write('''---
-Zipf's Law:''')
-st.text_input("Website", key="website")
-if st.button("Get rankings!", key="get_rankings_2"):
-    if st.session_state.website.startswith("http://") or st.session_state.website.startswith("https://"):
-        url = st.session_state.website
-    else:
-        url = "http://" + st.session_state.website
-    df = pd.DataFrame(scraper(url), columns=["term", "count"])
-    df = df.sort_values(by="count", ascending=False)
-    st.bar_chart(df, x="term", y="count", stack=False, horizontal=True, sort=False)
